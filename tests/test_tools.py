@@ -13,6 +13,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 # Add src/ to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -70,11 +71,11 @@ class TestGetTableSchema:
             assert "primary_key" in col
 
     def test_invalid_table_raises(self):
-        with pytest.raises(ValueError, match="not found"):
+        with pytest.raises(ToolError, match="not found"):
             get_table_schema("nonexistent_table_xyz")
 
     def test_sql_injection_rejected(self):
-        with pytest.raises(ValueError, match="Invalid table name"):
+        with pytest.raises(ToolError, match="Invalid table name"):
             get_table_schema("employees; DROP TABLE employees")
 
 
@@ -103,13 +104,17 @@ class TestExecuteSQL:
         assert "Acme GmbH" in result
 
     def test_delete_rejected(self):
-        with pytest.raises(ValueError, match="forbidden"):
+        with pytest.raises(ToolError, match="forbidden"):
             execute_sql("DELETE FROM employees WHERE id = 1")
 
     def test_drop_rejected(self):
-        with pytest.raises(ValueError, match="forbidden"):
+        with pytest.raises(ToolError, match="forbidden"):
             execute_sql("DROP TABLE employees")
 
     def test_empty_result(self):
         result = execute_sql("SELECT * FROM employees WHERE city = 'Atlantis'")
         assert "no rows" in result.lower()
+
+    def test_sql_error_raised(self):
+        with pytest.raises(ToolError, match="SQL Error: no such column"):
+            execute_sql("SELECT currency_code FROM customers")

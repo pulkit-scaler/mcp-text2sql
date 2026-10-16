@@ -1,5 +1,7 @@
 # 🛠️ MCP Text2SQL Demo — Mac Setup Guide (From Scratch)
 
+> **Updated for MCP spec `2026-07-28`** (MCP Python SDK v2). See [§22](#22-what-changed-in-mcp-2026-07-28-sdk-v2) for what changed.
+
 Every command is copy-paste ready. Tested on macOS. Uses your preferred `uv init` → `uv venv` → `source .venv/bin/activate` workflow.
 
 ---
@@ -27,6 +29,7 @@ Every command is copy-paste ready. Tested on macOS. Uses your preferred `uv init
 19. [How a Question Flows Through the System](#19-how-a-question-flows-through-the-system)
 20. [Full Command Summary](#20-full-command-summary)
 21. [Troubleshooting](#21-troubleshooting)
+22. [What Changed in MCP 2026-07-28 (SDK v2)](#22-what-changed-in-mcp-2026-07-28-sdk-v2)
 
 ---
 
@@ -94,17 +97,17 @@ Your prompt should now show:
 ## 5. Add Dependencies
 
 ```bash
-uv add mcp openai python-dotenv pydantic httpx
+uv add "mcp[cli]>=2.3,<3" openai python-dotenv pydantic httpx
 uv add --dev pytest pytest-asyncio ruff
 ```
 
 Verify:
 
 ```bash
-python -c "import mcp; import openai; import dotenv; print('✅ All deps OK')"
+python -c "import importlib.metadata as m, mcp, openai, dotenv; print('✅ All deps OK — mcp', m.version('mcp'))"
 ```
 
-**Expected:** `✅ All deps OK`
+**Expected:** `✅ All deps OK — mcp 2.3.0` (any `2.x` works; `1.x` is the pre-2026 SDK and will not run this code)
 
 ---
 
@@ -237,13 +240,25 @@ PYEOF
 
 ## 8. Create the MCP Server
 
-This is the core — it exposes the 3 Text2SQL tools via MCP.
+This is the core — it exposes the 3 Text2SQL tools via MCP. It uses `MCPServer` (SDK v2's name for `FastMCP`), and tools raise `ToolError` so the model can read what went wrong and retry.
 
 ```bash
 cat > src/mcp_server.py << 'PYEOF'
 """
 MCP Server — Text2SQL Tools
-Exposes: list_tables, get_table_schema, execute_sql
+============================
+Exposes exactly the three tools defined in the Colab PDF:
+  1. list_tables      — Get all table names in the database
+  2. get_table_schema — Get column names for a specific table
+  3. execute_sql      — Run a SELECT query and return results
+
+Also exposes MCP resources and prompts for richer integration.
+
+Built on the MCP Python SDK v2 (`MCPServer`, formerly `FastMCP`), which speaks
+protocol revision 2026-07-28 and still serves older clients that use the
+2025-era `initialize` handshake.
+
+Run directly:  uv run python src/mcp_server.py
 """
 
 import logging
@@ -253,37 +268,45 @@ import sqlite3
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.prompts import base
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
+from mcp.server.mcpserver.prompts import base
 from pydantic import Field
 
+# ── Configuration ────────────────────────────────────────────────
 load_dotenv()
 
-DB_PATH = os.getenv(
-    "DATABASE_PATH",
-    str(Path(__file__).resolve().parent.parent / "data" / "sample.db"),
-)
+DB_PATH = os.getenv("DATABASE_PATH", str(Path(__file__).resolve().parent.parent / "data" / "sample.db"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+)
 logger = logging.getLogger("text2sql-mcp")
 
-mcp = FastMCP("Text2SQL-MCP", log_level="INFO")
+# ── MCP Server Instance ─────────────────────────────────────────
+mcp = MCPServer("Text2SQL-MCP", log_level="INFO")
 
 
+# ── Helper ───────────────────────────────────────────────────────
 def _get_connection() -> sqlite3.Connection:
+    """Return a new SQLite connection. Raises if DB not found."""
     if not Path(DB_PATH).exists():
         raise FileNotFoundError(
-            f"Database not found at {DB_PATH}. Run: python scripts/setup_db.py"
+            f"Database not found at {DB_PATH}. "
+            "Run 'uv run python scripts/setup_db.py' first."
         )
     return sqlite3.connect(DB_PATH)
 
 
-# ── TOOL 1: list_tables ─────────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TOOL 1 — list_tables
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @mcp.tool(
     name="list_tables",
     description=(
         "Get all table names from the SQLite database. "
-        "Call this first to discover available tables."
+        "Call this first to discover which tables are available before writing any queries."
     ),
 )
 def list_tables() -> list[str]:
@@ -299,27 +322,33 @@ def list_tables() -> list[str]:
         conn.close()
 
 
-# ── TOOL 2: get_table_schema ────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TOOL 2 — get_table_schema
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @mcp.tool(
     name="get_table_schema",
     description=(
         "Get column names and types for a specific table. "
-        "Use after identifying the table with list_tables."
+        "Use this after identifying the relevant table with list_tables."
     ),
 )
 def get_table_schema(
     table_name: str = Field(description="The exact name of the table to inspect"),
 ) -> list[dict]:
     logger.info(f"🔧 get_table_schema called — table_name={table_name!r}")
+
+    # Prevent SQL injection via table name.
+    # ToolError (not ValueError): in SDK v2 only a ToolError's message reaches the model.
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table_name):
-        raise ValueError(f"Invalid table name: {table_name!r}")
+        raise ToolError(f"Invalid table name: {table_name!r}")
+
     conn = _get_connection()
     try:
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info(`{table_name}`);")
         rows = cur.fetchall()
         if not rows:
-            raise ValueError(f"Table '{table_name}' not found in the database.")
+            raise ToolError(f"Table '{table_name}' not found in the database.")
         columns = [
             {"name": row[1], "type": row[2], "nullable": not row[3], "primary_key": bool(row[5])}
             for row in rows
@@ -330,78 +359,117 @@ def get_table_schema(
         conn.close()
 
 
-# ── TOOL 3: execute_sql ─────────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TOOL 3 — execute_sql
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @mcp.tool(
     name="execute_sql",
     description=(
-        "Execute a SQL SELECT query and return results. "
-        "ONLY SELECT allowed — no INSERT/UPDATE/DELETE/DROP."
+        "Execute a SQL SELECT query against the database and return results as rows. "
+        "ONLY SELECT queries are allowed — no INSERT, UPDATE, DELETE, DROP, or ALTER."
     ),
 )
 def execute_sql(
     query: str = Field(description="A valid SQL SELECT query to execute"),
 ) -> str:
     logger.info(f"🔧 execute_sql called — query={query!r}")
+
+    # Safety: reject anything that isn't a SELECT
     normalized = query.strip().upper()
     forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE", "REPLACE"]
     for keyword in forbidden:
         if normalized.startswith(keyword) or f" {keyword} " in f" {normalized} ":
-            raise ValueError(
-                f"Only SELECT queries are allowed. Detected forbidden keyword: {keyword}"
+            raise ToolError(
+                f"Only SELECT queries are allowed. "
+                f"Detected forbidden keyword: {keyword}"
             )
+
     conn = _get_connection()
     try:
         cur = conn.cursor()
         cur.execute(query)
         columns = [desc[0] for desc in cur.description] if cur.description else []
         rows = cur.fetchall()
+
+        # Format as a readable table string
         if not rows:
-            return "(no rows returned)"
-        header = " | ".join(columns)
-        separator = "-+-".join("-" * max(len(col), 8) for col in columns)
-        data_rows = [" | ".join(str(val) for val in row) for row in rows]
-        result = f"{header}\n{separator}\n" + "\n".join(data_rows)
+            result = "(no rows returned)"
+        else:
+            header = " | ".join(columns)
+            separator = "-+-".join("-" * max(len(col), 8) for col in columns)
+            data_rows = [" | ".join(str(val) for val in row) for row in rows]
+            result = f"{header}\n{separator}\n" + "\n".join(data_rows)
+
         logger.info(f"   ↳ returned {len(rows)} rows")
         return result
     except sqlite3.Error as e:
+        # Raised as a ToolError so the result is flagged is_error=True and the
+        # model still reads the message and can retry with a corrected query.
         error_msg = f"SQL Error: {e}"
         logger.error(f"   ↳ {error_msg}")
-        return error_msg
+        raise ToolError(error_msg) from e
     finally:
         conn.close()
 
 
-# ── MCP Resources ────────────────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MCP RESOURCE — Database info
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @mcp.resource("db://tables", mime_type="application/json")
 def resource_list_tables() -> list[str]:
+    """Resource: returns the list of table names as JSON."""
     return list_tables()
 
 
 @mcp.resource("db://schema/{table_name}", mime_type="application/json")
 def resource_table_schema(table_name: str) -> list[dict]:
-    return get_table_schema(table_name)
+    """Resource: returns column info for a table as JSON."""
+    try:
+        return get_table_schema(table_name)
+    except ToolError as e:
+        # Protocol "resource not found" (-32602 with the URI in error.data)
+        raise ResourceNotFoundError(str(e)) from e
 
 
-# ── MCP Prompt ───────────────────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MCP PROMPT — Text2SQL analyst prompt
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @mcp.prompt(
     name="text2sql_analyst",
-    description="Generate a system prompt for a Text2SQL analyst.",
+    description="Generate a system prompt for a Text2SQL analyst given a user question.",
 )
 def text2sql_analyst_prompt(
     question: str = Field(description="The user's natural-language question"),
 ) -> list[base.Message]:
     prompt = f"""You are a Senior SQL Developer and Data Analyst.
-Follow this workflow:
-  1. List tables with list_tables.
-  2. Get schema with get_table_schema.
-  3. Write a SQLite SELECT query.
-  4. Execute with execute_sql.
-RULES: Only use confirmed names. Never modify data. Use SQLite syntax.
-OUTPUT: Show SQL, result, and a brief summary.
+
+INSTRUCTIONS:
+You generate and execute SQL queries against a SQLite database.
+Follow this workflow for every user question:
+  1. List all available tables using the list_tables tool.
+  2. Get the schema (columns) of the relevant table(s) using get_table_schema.
+  3. Write a syntactically correct SQLite SELECT query.
+  4. Execute the query using execute_sql and return the results.
+
+RULES:
+  - ONLY use table and column names confirmed by the schema tool.
+  - NEVER guess or invent table or column names.
+  - NEVER run DELETE, DROP, UPDATE, INSERT, or any data-modifying SQL.
+  - If the question is unclear, state your assumptions first.
+  - If a query fails, analyze the error and retry with a corrected query.
+
+OUTPUT FORMAT:
+Always respond with:
+  - The SQL query you generated
+  - The query result
+  - A short natural-language summary of the answer
+
 USER QUESTION: {question}"""
+
     return [base.UserMessage(prompt)]
 
 
+# ── Entry point ──────────────────────────────────────────────────
 if __name__ == "__main__":
     logger.info(f"Starting Text2SQL MCP Server (db={DB_PATH})")
     mcp.run(transport="stdio")
@@ -412,9 +480,22 @@ PYEOF
 
 ## 9. Create the MCP Client
 
+`mcp.Client` connects with whichever protocol the server speaks: it asks the server `server/discover` (2026-07-28, no handshake) and falls back to the old `initialize` handshake for older servers.
+
 ```bash
 cat > src/mcp_client.py << 'PYEOF'
-"""MCP Client — Thin wrapper over mcp.ClientSession via stdio."""
+"""
+MCP Client — Thin wrapper over mcp.Client via stdio transport.
+
+`mcp.Client` (MCP Python SDK v2) negotiates the protocol version on connect:
+it probes `server/discover` (protocol 2026-07-28, no handshake, no session) and
+falls back to the legacy `initialize` handshake for older servers.
+
+Usage:
+    async with MCPClient(command="uv", args=["run", "python", "src/mcp_server.py"]) as client:
+        tools = await client.list_tools()
+        result = await client.call_tool("list_tables", {})
+"""
 
 import asyncio
 import json
@@ -423,38 +504,44 @@ import sys
 from contextlib import AsyncExitStack
 from typing import Any, Optional
 
-from mcp import ClientSession, StdioServerParameters, types
-from mcp.client.stdio import stdio_client
-from pydantic import AnyUrl
+from mcp import Client, StdioServerParameters, types
 
 logger = logging.getLogger("text2sql-client")
 
 
 class MCPClient:
-    def __init__(self, command: str, args: list[str], env: Optional[dict] = None) -> None:
+    """Async-context-manager MCP client that spawns & connects to an MCP server."""
+
+    def __init__(
+        self,
+        command: str,
+        args: list[str],
+        env: Optional[dict] = None,
+        mode: str = "auto",
+    ) -> None:
         self._command = command
         self._args = args
         self._env = env
-        self._session: Optional[ClientSession] = None
+        self._mode = mode  # "auto" (default), "legacy", or a pinned version like "2026-07-28"
+        self._client: Optional[Client] = None
         self._exit_stack = AsyncExitStack()
 
+    # ── Connection lifecycle ─────────────────────────────────────
     async def connect(self) -> None:
         server_params = StdioServerParameters(
-            command=self._command, args=self._args, env=self._env,
+            command=self._command,
+            args=self._args,
+            env=self._env,
         )
-        stdio_transport = await self._exit_stack.enter_async_context(
-            stdio_client(server_params)
+        # Spawns the server subprocess and negotiates the protocol version
+        self._client = await self._exit_stack.enter_async_context(
+            Client(server_params, mode=self._mode)
         )
-        read_stream, write_stream = stdio_transport
-        self._session = await self._exit_stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
-        )
-        await self._session.initialize()
-        logger.info("MCP client connected to server")
+        logger.info(f"MCP client connected to server (protocol {self._client.protocol_version})")
 
     async def cleanup(self) -> None:
         await self._exit_stack.aclose()
-        self._session = None
+        self._client = None
 
     async def __aenter__(self) -> "MCPClient":
         await self.connect()
@@ -463,50 +550,77 @@ class MCPClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         await self.cleanup()
 
+    # ── Connection accessors ─────────────────────────────────────
     @property
-    def session(self) -> ClientSession:
-        if self._session is None:
-            raise ConnectionError(
-                "Client not connected. Use 'async with MCPClient(...)' or call connect()."
-            )
-        return self._session
+    def client(self) -> Client:
+        if self._client is None:
+            raise ConnectionError("Client not connected. Use 'async with MCPClient(...)' or call connect().")
+        return self._client
 
+    @property
+    def protocol_version(self) -> str:
+        return self.client.protocol_version
+
+    @property
+    def server_info(self) -> Optional[types.Implementation]:
+        return self.client.server_info
+
+    # ── Tool operations ──────────────────────────────────────────
     async def list_tools(self) -> list[types.Tool]:
-        result = await self.session.list_tools()
+        result = await self.client.list_tools()
         return result.tools
 
     async def call_tool(self, tool_name: str, tool_input: dict) -> types.CallToolResult:
-        logger.info(f"Calling tool: {tool_name}")
-        return await self.session.call_tool(tool_name, tool_input)
+        logger.info(f"Calling tool: {tool_name} with input: {json.dumps(tool_input, default=str)[:200]}")
+        result = await self.client.call_tool(tool_name, tool_input)
+        return result
 
+    # ── Prompt operations ────────────────────────────────────────
     async def list_prompts(self) -> list[types.Prompt]:
-        result = await self.session.list_prompts()
+        result = await self.client.list_prompts()
         return result.prompts
 
     async def get_prompt(self, prompt_name: str, args: dict[str, str]) -> Any:
-        result = await self.session.get_prompt(prompt_name, args)
+        result = await self.client.get_prompt(prompt_name, args)
         return result.messages
 
+    # ── Resource operations ──────────────────────────────────────
     async def read_resource(self, uri: str) -> Any:
-        result = await self.session.read_resource(AnyUrl(uri))
+        result = await self.client.read_resource(uri)
         resource = result.contents[0]
         if isinstance(resource, types.TextResourceContents):
-            if resource.mimeType == "application/json":
+            if resource.mime_type == "application/json":
                 return json.loads(resource.text)
             return resource.text
         return resource
 
 
+def result_text(result: types.CallToolResult) -> str:
+    """Join every text block of a tool result.
+
+    A tool returning a list (e.g. list_tables) yields one content block per item,
+    so reading only content[0] would drop everything after the first item.
+    """
+    texts = [block.text for block in result.content if isinstance(block, types.TextContent)]
+    return "\n".join(texts) if texts else "(empty)"
+
+
+# ── Quick self-test ──────────────────────────────────────────────
 async def _self_test() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    async with MCPClient(command="python", args=["src/mcp_server.py"]) as client:
+    async with MCPClient(command="uv", args=["run", "python", "src/mcp_server.py"]) as client:
         tools = await client.list_tools()
-        print(f"\n✅ Connected. Available tools: {[t.name for t in tools]}")
+        print(f"\n✅ Connected. Protocol: {client.protocol_version}")
+        print(f"🧰 Available tools: {[t.name for t in tools]}")
+
+        # Quick tool call
         result = await client.call_tool("list_tables", {})
-        print(f"📋 Tables: {result.content[0].text}")
+        print(f"📋 Tables: {result.structured_content['result']}")
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(_self_test())
 PYEOF
 ```
@@ -517,7 +631,15 @@ PYEOF
 
 ```bash
 cat > src/agent.py << 'PYEOF'
-"""Text2SQL Agent — ReAct loop wiring OpenAI LLM to MCP tools."""
+"""
+Text2SQL Agent — Orchestration Loop
+=====================================
+Connects an OpenAI LLM to the MCP Text2SQL server and runs an interactive
+ReAct loop: the LLM reasons → calls tools → observes results → repeats.
+
+Usage:
+    uv run python src/agent.py
+"""
 
 import asyncio
 import json
@@ -529,17 +651,23 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from mcp_client import MCPClient
+from mcp_client import MCPClient, result_text
 
+# ── Configuration ────────────────────────────────────────────────
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 logger = logging.getLogger("text2sql-agent")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-MAX_ITERATIONS = 15
+MAX_ITERATIONS = 15  # safety limit to prevent infinite loops
 
+
+# ── Persona (from Colab Component 1) ────────────────────────────
 SYSTEM_PROMPT = """You are a Senior SQL Developer and Data Analyst.
 
 INSTRUCTIONS:
@@ -556,7 +684,7 @@ RULES:
   - NEVER run DELETE, DROP, UPDATE, INSERT, or any data-modifying SQL.
   - If the question is unclear, state your assumptions first.
   - If a query fails, analyze the error and retry with a corrected query.
-  - Use SQLite syntax (e.g., || for concatenation, not CONCAT).
+  - Use SQLite syntax (e.g., use || for string concatenation, not CONCAT).
 
 OUTPUT FORMAT:
 Always respond with:
@@ -567,20 +695,25 @@ Always respond with:
 
 
 def _mcp_tools_to_openai_schema(tools) -> list[dict[str, Any]]:
-    return [
-        {
+    """Convert MCP tool definitions to OpenAI function-calling format."""
+    openai_tools = []
+    for tool in tools:
+        schema = {
             "type": "function",
             "function": {
                 "name": tool.name,
                 "description": tool.description or "",
-                "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+                "parameters": tool.input_schema if tool.input_schema else {"type": "object", "properties": {}},
             },
         }
-        for tool in tools
-    ]
+        openai_tools.append(schema)
+    return openai_tools
 
 
 async def run_agent_loop(client: MCPClient, openai_client: OpenAI) -> None:
+    """Interactive REPL: user asks questions, agent uses MCP tools to answer."""
+
+    # 1. Discover tools from the MCP server
     mcp_tools = await client.list_tools()
     openai_tools = _mcp_tools_to_openai_schema(mcp_tools)
     tool_names = [t.name for t in mcp_tools]
@@ -589,12 +722,14 @@ async def run_agent_loop(client: MCPClient, openai_client: OpenAI) -> None:
     print("  🗄️  Text2SQL Agent — powered by MCP")
     print("=" * 60)
     print(f"  Model:  {OPENAI_MODEL}")
+    print(f"  MCP:    protocol {client.protocol_version}")
     print(f"  Tools:  {tool_names}")
-    print("  Type 'quit' or 'exit' to stop.\n")
+    print(f"  Type 'quit' or 'exit' to stop.\n")
 
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     while True:
+        # ── Get user input ───────────────────────────────────────
         try:
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -609,6 +744,7 @@ async def run_agent_loop(client: MCPClient, openai_client: OpenAI) -> None:
 
         messages.append({"role": "user", "content": user_input})
 
+        # ── ReAct loop: call LLM → maybe call tool → repeat ─────
         for iteration in range(MAX_ITERATIONS):
             response = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -617,51 +753,72 @@ async def run_agent_loop(client: MCPClient, openai_client: OpenAI) -> None:
                 tools=openai_tools,
                 tool_choice="auto",
             )
+
             assistant_msg = response.choices[0].message
 
+            # Case A: LLM produced a final text answer
             if not assistant_msg.tool_calls:
                 print(f"\n🤖 Agent:\n{assistant_msg.content}\n")
                 messages.append({"role": "assistant", "content": assistant_msg.content})
                 break
 
-            messages.append(assistant_msg.model_dump())
+            # Case B: LLM wants to call one or more tools
+            # Append the assistant message (with tool_calls) to history.
+            # Only the standard fields: OpenAI-compatible providers (e.g. Groq)
+            # reject OpenAI-only extras such as "annotations".
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_msg.content,
+                    "tool_calls": [tc.model_dump(exclude_none=True) for tc in assistant_msg.tool_calls],
+                }
+            )
 
             for tool_call in assistant_msg.tool_calls:
                 fn_name = tool_call.function.name
                 fn_args = json.loads(tool_call.function.arguments)
+
                 print(f"  🔧 [{iteration + 1}] Calling {fn_name}({json.dumps(fn_args)}) ...")
 
                 try:
                     result = await client.call_tool(fn_name, fn_args)
-                    tool_output = result.content[0].text if result.content else "(empty)"
+                    # Extract text from MCP result (all blocks — list results span several)
+                    tool_output = result_text(result)
                 except Exception as e:
                     tool_output = f"Error: {e}"
                     logger.error(f"Tool call failed: {e}")
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_output,
-                })
+                # Append tool result to messages
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_output,
+                    }
+                )
         else:
-            print("⚠️  Max iterations reached.")
+            print("⚠️  Max iterations reached. The agent may need a simpler question.")
 
 
+# ── Main ─────────────────────────────────────────────────────────
 async def main() -> None:
     if not OPENAI_API_KEY:
-        print("❌ Error: OPENAI_API_KEY not set. Copy .env.example → .env and add your key.")
+        print("❌ Error: OPENAI_API_KEY not set. Copy .env.example to .env and add your key.")
         sys.exit(1)
 
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+    # Spawn MCP server as a subprocess and connect
     async with MCPClient(
-        command="python",
-        args=["src/mcp_server.py"],
+        command="uv",
+        args=["run", "python", "src/mcp_server.py"],
     ) as mcp_client:
         await run_agent_loop(mcp_client, openai_client)
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
 PYEOF
 ```
@@ -675,6 +832,10 @@ cat > .env.example << 'EOF'
 OPENAI_API_KEY=sk-your-key-here
 OPENAI_MODEL=gpt-4o-mini
 DATABASE_PATH=./data/sample.db
+# Using Groq (or another OpenAI-compatible provider)? Set these instead:
+# OPENAI_API_KEY=gsk_your-groq-key
+# OPENAI_BASE_URL=https://api.groq.com/openai/v1
+# OPENAI_MODEL=openai/gpt-oss-120b
 EOF
 
 cp .env.example .env
@@ -683,13 +844,15 @@ open -e .env
 
 **In the TextEdit window that opens**, change `sk-your-key-here` to your actual OpenAI API key. Save (`⌘S`) and close.
 
+> **Using Groq instead?** Groq's API is OpenAI-compatible, so the agent needs no code changes. Put your Groq key (`gsk_...`) in `OPENAI_API_KEY`, and set `OPENAI_BASE_URL=https://api.groq.com/openai/v1` and a tool-calling model such as `OPENAI_MODEL=openai/gpt-oss-120b` (the commented lines in `.env.example`). The `openai` library reads `OPENAI_BASE_URL` on its own.
+
 Verify:
 
 ```bash
 python -c "
 from dotenv import load_dotenv; import os; load_dotenv()
 key = os.getenv('OPENAI_API_KEY', '')
-print(f'✅ Key loaded ({key[:8]}...{key[-4:]})' if key.startswith('sk-') else '❌ Key not set')
+print(f'✅ Key loaded ({key[:8]}...{key[-4:]})' if key and key != 'sk-your-key-here' else '❌ Key not set')
 "
 ```
 
@@ -699,74 +862,133 @@ print(f'✅ Key loaded ({key[:8]}...{key[-4:]})' if key.startswith('sk-') else '
 
 ```bash
 cat > tests/test_tools.py << 'PYEOF'
-"""Unit tests for the 3 MCP tools. No API key needed."""
+"""
+Unit tests for the MCP Text2SQL tools.
+
+These test the tool functions directly (no MCP transport, no LLM).
+They only need the sample database — no API keys required.
+
+Run:  uv run python -m pytest tests/test_tools.py -v
+"""
 
 import os
 import sys
+import sqlite3
 from pathlib import Path
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
+# Add src/ to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+# Set DB_PATH before importing the server module
 DB_PATH = str(Path(__file__).resolve().parent.parent / "data" / "sample.db")
 os.environ["DATABASE_PATH"] = DB_PATH
 
-from mcp_server import list_tables, get_table_schema, execute_sql
+from mcp_server import list_tables, get_table_schema, execute_sql  # noqa: E402
 
 
+# ── Fixtures ─────────────────────────────────────────────────────
+@pytest.fixture(scope="session", autouse=True)
+def ensure_db():
+    """Make sure the sample database exists before tests run."""
+    if not Path(DB_PATH).exists():
+        # Create it inline (same as setup_db.py)
+        from scripts.setup_db import setup
+        setup()
+    assert Path(DB_PATH).exists(), f"Database not found at {DB_PATH}"
+
+
+# ── Tool 1: list_tables ─────────────────────────────────────────
 class TestListTables:
     def test_returns_list(self):
-        assert isinstance(list_tables(), list)
+        result = list_tables()
+        assert isinstance(result, list)
 
     def test_contains_expected_tables(self):
-        tables = list_tables()
-        assert "employees" in tables
-        assert "customers" in tables
-        assert "orders" in tables
+        result = list_tables()
+        assert "employees" in result
+        assert "customers" in result
+        assert "orders" in result
+
+    def test_returns_at_least_three_tables(self):
+        result = list_tables()
+        assert len(result) >= 3
 
 
+# ── Tool 2: get_table_schema ────────────────────────────────────
 class TestGetTableSchema:
     def test_employees_columns(self):
-        cols = [c["name"] for c in get_table_schema("employees")]
-        assert "name" in cols and "salary" in cols and "department" in cols
+        result = get_table_schema("employees")
+        col_names = [c["name"] for c in result]
+        assert "id" in col_names
+        assert "name" in col_names
+        assert "department" in col_names
+        assert "salary" in col_names
+
+    def test_returns_type_info(self):
+        result = get_table_schema("employees")
+        for col in result:
+            assert "name" in col
+            assert "type" in col
+            assert "primary_key" in col
 
     def test_invalid_table_raises(self):
-        with pytest.raises(ValueError, match="not found"):
-            get_table_schema("nonexistent_xyz")
+        with pytest.raises(ToolError, match="not found"):
+            get_table_schema("nonexistent_table_xyz")
 
     def test_sql_injection_rejected(self):
-        with pytest.raises(ValueError, match="Invalid table name"):
+        with pytest.raises(ToolError, match="Invalid table name"):
             get_table_schema("employees; DROP TABLE employees")
 
 
+# ── Tool 3: execute_sql ─────────────────────────────────────────
 class TestExecuteSQL:
-    def test_count_employees(self):
-        assert "8" in execute_sql("SELECT COUNT(*) FROM employees")
+    def test_simple_count(self):
+        result = execute_sql("SELECT COUNT(*) as cnt FROM employees")
+        assert "8" in result  # 8 employees in sample data
+
+    def test_select_returns_data(self):
+        result = execute_sql("SELECT name, department FROM employees WHERE city = 'Berlin'")
+        assert "Alice" in result
+        assert "Engineering" in result
 
     def test_eur_customers(self):
-        assert "4" in execute_sql("SELECT COUNT(*) FROM customers WHERE currency = 'EUR'")
+        """Matches the Colab's demo question: How many customers pay in EUR?"""
+        result = execute_sql("SELECT COUNT(*) as eur_count FROM customers WHERE currency = 'EUR'")
+        assert "4" in result  # 4 EUR customers in sample data
 
     def test_join_query(self):
         result = execute_sql(
             "SELECT c.name, o.product FROM orders o "
-            "JOIN customers c ON o.customer_id = c.id WHERE c.country = 'Germany'"
+            "JOIN customers c ON o.customer_id = c.id "
+            "WHERE c.country = 'Germany'"
         )
         assert "Acme GmbH" in result
 
     def test_delete_rejected(self):
-        with pytest.raises(ValueError, match="forbidden"):
+        with pytest.raises(ToolError, match="forbidden"):
             execute_sql("DELETE FROM employees WHERE id = 1")
 
     def test_drop_rejected(self):
-        with pytest.raises(ValueError, match="forbidden"):
+        with pytest.raises(ToolError, match="forbidden"):
             execute_sql("DROP TABLE employees")
 
     def test_empty_result(self):
-        assert "no rows" in execute_sql(
-            "SELECT * FROM employees WHERE city = 'Atlantis'"
-        ).lower()
+        result = execute_sql("SELECT * FROM employees WHERE city = 'Atlantis'")
+        assert "no rows" in result.lower()
+
+    def test_sql_error_raised(self):
+        with pytest.raises(ToolError, match="SQL Error: no such column"):
+            execute_sql("SELECT currency_code FROM customers")
 PYEOF
 ```
+
+The repo also ships two connection-level test files (copy them from the repo):
+
+- `tests/test_mcp_protocol.py` — talks to the server over a real MCP connection (in memory and over stdio) and checks the negotiated protocol (`2026-07-28`, plus the legacy `2025-11-25` handshake), every tool, resource and prompt, and that tool errors reach the model.
+- `tests/test_agent_loop.py` — runs `agent.py`'s ReAct loop against the real server with a scripted stand-in for OpenAI, so the whole agent → MCP → SQLite path is tested without an API key.
 
 ---
 
@@ -829,28 +1051,26 @@ conn.close()
 ## 15. Run Unit Tests
 
 ```bash
-python -m pytest tests/test_tools.py -v
+python -m pytest tests -v
 ```
 
-**Expected:**
+**Expected** (abridged):
 
 ```
+tests/test_agent_loop.py::test_agent_loop_end_to_end PASSED
+tests/test_mcp_protocol.py::test_negotiates_2026_07_28 PASSED
+tests/test_mcp_protocol.py::test_legacy_handshake_still_supported PASSED
+...
+tests/test_mcp_protocol.py::test_stdio_end_to_end[auto-2026-07-28] PASSED
+tests/test_mcp_protocol.py::test_stdio_end_to_end[legacy-2025-11-25] PASSED
 tests/test_tools.py::TestListTables::test_returns_list PASSED
-tests/test_tools.py::TestListTables::test_contains_expected_tables PASSED
-tests/test_tools.py::TestGetTableSchema::test_employees_columns PASSED
-tests/test_tools.py::TestGetTableSchema::test_invalid_table_raises PASSED
-tests/test_tools.py::TestGetTableSchema::test_sql_injection_rejected PASSED
-tests/test_tools.py::TestExecuteSQL::test_count_employees PASSED
-tests/test_tools.py::TestExecuteSQL::test_eur_customers PASSED
-tests/test_tools.py::TestExecuteSQL::test_join_query PASSED
-tests/test_tools.py::TestExecuteSQL::test_delete_rejected PASSED
-tests/test_tools.py::TestExecuteSQL::test_drop_rejected PASSED
-tests/test_tools.py::TestExecuteSQL::test_empty_result PASSED
+...
+tests/test_tools.py::TestExecuteSQL::test_sql_error_raised PASSED
 
-11 passed
+32 passed
 ```
 
-No API key needed for this step.
+No API key needed for this step. `bash scripts/smoke_test.sh` runs these tests plus the connection check from §16 in one go.
 
 ---
 
@@ -863,19 +1083,19 @@ python src/mcp_client.py
 **Expected:**
 
 ```
-✅ Connected. Available tools: ['list_tables', 'get_table_schema', 'execute_sql']
-📋 Tables: ["customers", "employees", "orders"]
+✅ Connected. Protocol: 2026-07-28
+🧰 Available tools: ['list_tables', 'get_table_schema', 'execute_sql']
+📋 Tables: ['customers', 'employees', 'orders']
 ```
 
-This proves the MCP stdio transport works. No API key needed.
+This proves the MCP stdio transport works and that client and server agreed on protocol `2026-07-28`. No API key needed.
 
 ---
 
 ## 17. Run the Interactive Agent
 
 ```bash
-cd src
-python agent.py
+python src/agent.py
 ```
 
 **Expected startup:**
@@ -885,6 +1105,7 @@ python agent.py
   🗄️  Text2SQL Agent — powered by MCP
 ============================================================
   Model:  gpt-4o-mini
+  MCP:    protocol 2026-07-28
   Tools:  ['list_tables', 'get_table_schema', 'execute_sql']
   Type 'quit' or 'exit' to stop.
 
@@ -912,7 +1133,7 @@ How many customers pay in EUR?
 
 Type `quit` to exit.
 
-> **Important:** Run `agent.py` from inside the `src/` directory. The MCP server subprocess is spawned with the path `src/mcp_server.py` relative to the project root.
+> **Important:** Run the agent from the **project root** (`python src/agent.py`), not from inside `src/`. The MCP server subprocess is spawned with the path `src/mcp_server.py` relative to the directory you start in; from inside `src/` it fails with `MCPError: Connection closed`.
 
 ---
 
@@ -967,6 +1188,7 @@ What's the weather like?
   │                returns: {tool_call: "list_tables", args: {}}
   ▼
  mcp_client.py  →  sends JSON-RPC over stdio pipe
+  │                (2026-07-28: protocol version rides in each request's _meta; no handshake)
   │
   ▼
  mcp_server.py  →  list_tables()
@@ -1021,7 +1243,7 @@ uv venv
 source .venv/bin/activate
 
 # ── Dependencies ─────────────────────────────────────────
-uv add mcp openai python-dotenv pydantic httpx
+uv add "mcp[cli]>=2.3,<3" openai python-dotenv pydantic httpx
 uv add --dev pytest pytest-asyncio ruff
 
 # ── Project structure ────────────────────────────────────
@@ -1040,14 +1262,13 @@ open -e .env    # paste your OpenAI API key, save, close
 python scripts/setup_db.py
 
 # ── Tests (no API key needed) ────────────────────────────
-python -m pytest tests/test_tools.py -v
+python -m pytest tests -v
 
 # ── MCP connection test (no API key needed) ──────────────
 python src/mcp_client.py
 
-# ── Run the agent ────────────────────────────────────────
-cd src
-python agent.py
+# ── Run the agent (from the project root) ────────────────
+python src/agent.py
 ```
 
 ---
@@ -1062,10 +1283,34 @@ python agent.py
 | `FileNotFoundError: Database not found` | `python scripts/setup_db.py` |
 | `OPENAI_API_KEY not set` | `cp .env.example .env` → paste your key |
 | `openai.AuthenticationError` | Key is invalid — regenerate at platform.openai.com |
+| `400 ... property 'annotations' is unsupported` (Groq and other OpenAI-compatible APIs) | Agent code sends OpenAI-only fields back in the history. Append only `role`, `content` and `tool_calls` for assistant messages, as `src/agent.py` does |
 | `Server process exited` | Run `python src/mcp_server.py` standalone to see the error |
 | `RateLimitError` | Wait 60s and retry, or check billing at platform.openai.com/usage |
 | Tests fail with import error | Make sure you're in the project root with venv active |
+| `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` | Code written for SDK v1. `FastMCP` is now `MCPServer`: `from mcp.server.mcpserver import MCPServer` (see §22) |
+| `AttributeError: 'Tool' object has no attribute 'inputSchema'` | SDK v2 uses snake_case attributes: `tool.input_schema`, `result.is_error`, `resource.mime_type` |
+| `MCPError: Connection closed` when starting the agent | Run from the project root: `python src/agent.py` |
+| Model only sees `Error executing tool <name>` | The tool raised a plain exception. Raise `ToolError` so the message reaches the model |
 
 ---
 
+## 22. What Changed in MCP 2026-07-28 (SDK v2)
 
+The MCP spec revision **2026-07-28** and the **MCP Python SDK 2.x** (released the same day) changed how clients connect and renamed parts of the SDK. Here is what that meant for this project:
+
+| Change | What it means here |
+|--------|--------------------|
+| No more `initialize` handshake or protocol sessions. Each request carries its protocol version in `_meta`, and servers answer a new `server/discover` request | `mcp_client.py` uses `mcp.Client`, which runs `server/discover` and falls back to the old handshake for older servers. A hand-made `ClientSession` + `initialize()` would still speak the old protocol |
+| `FastMCP` renamed to `MCPServer` (`mcp.server.fastmcp` → `mcp.server.mcpserver`) | Updated imports in `mcp_server.py` |
+| Python field names are snake_case (`inputSchema` → `input_schema`, `mimeType` → `mime_type`, `isError` → `is_error`) | Updated in `agent.py` and `mcp_client.py`. The JSON on the wire is still camelCase |
+| Resource URIs are plain `str` (no `pydantic.AnyUrl`) | `read_resource("db://tables")` takes the string directly |
+| A plain exception in a tool now reaches the model only as `Error executing tool <name>`; only `ToolError` messages pass through | All tool errors raise `ToolError`, so the model can still read "Invalid table name…" or "SQL Error: no such column…" and retry |
+| Missing resource is error `-32602` (was `-32002`), with the URI in `error.data` | `db://schema/<missing>` raises `ResourceNotFoundError` |
+| Every result carries `resultType`, and list results carry `ttlMs`/`cacheScope` caching hints | Handled by the SDK; nothing to change |
+| MCP's Logging feature (plus Roots and Sampling) is deprecated: log to `stderr` instead | The server already logs to `stderr` with Python `logging` |
+
+Older 2025-era clients (anything that still sends `initialize`) keep working against this server; `tests/test_mcp_protocol.py` checks both protocols.
+
+**Also fixed in this update:** a tool that returns a list (`list_tables`, `get_table_schema`) produces one content block per item, and the agent used to read only the first block, so the model saw just `customers` instead of every table. `agent.py` now joins all blocks (`result_text()` in `mcp_client.py`).
+
+References: [Spec changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog) · [SDK v1 → v2 migration guide](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/migration.md)

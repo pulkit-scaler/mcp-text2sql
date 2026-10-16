@@ -8,6 +8,10 @@ Exposes exactly the three tools defined in the Colab PDF:
 
 Also exposes MCP resources and prompts for richer integration.
 
+Built on the MCP Python SDK v2 (`MCPServer`, formerly `FastMCP`), which speaks
+protocol revision 2026-07-28 and still serves older clients that use the
+2025-era `initialize` handshake.
+
 Run directly:  uv run python src/mcp_server.py
 """
 
@@ -18,8 +22,9 @@ import sqlite3
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.prompts import base
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
+from mcp.server.mcpserver.prompts import base
 from pydantic import Field
 
 # ── Configuration ────────────────────────────────────────────────
@@ -34,7 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger("text2sql-mcp")
 
 # ── MCP Server Instance ─────────────────────────────────────────
-mcp = FastMCP("Text2SQL-MCP", log_level="INFO")
+mcp = MCPServer("Text2SQL-MCP", log_level="INFO")
 
 
 # ── Helper ───────────────────────────────────────────────────────
@@ -86,9 +91,10 @@ def get_table_schema(
 ) -> list[dict]:
     logger.info(f"🔧 get_table_schema called — table_name={table_name!r}")
 
-    # Prevent SQL injection via table name
+    # Prevent SQL injection via table name.
+    # ToolError (not ValueError): in SDK v2 only a ToolError's message reaches the model.
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table_name):
-        raise ValueError(f"Invalid table name: {table_name!r}")
+        raise ToolError(f"Invalid table name: {table_name!r}")
 
     conn = _get_connection()
     try:
@@ -96,7 +102,7 @@ def get_table_schema(
         cur.execute(f"PRAGMA table_info(`{table_name}`);")
         rows = cur.fetchall()
         if not rows:
-            raise ValueError(f"Table '{table_name}' not found in the database.")
+            raise ToolError(f"Table '{table_name}' not found in the database.")
         columns = [
             {"name": row[1], "type": row[2], "nullable": not row[3], "primary_key": bool(row[5])}
             for row in rows
@@ -127,7 +133,7 @@ def execute_sql(
     forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE", "REPLACE"]
     for keyword in forbidden:
         if normalized.startswith(keyword) or f" {keyword} " in f" {normalized} ":
-            raise ValueError(
+            raise ToolError(
                 f"Only SELECT queries are allowed. "
                 f"Detected forbidden keyword: {keyword}"
             )
@@ -151,9 +157,11 @@ def execute_sql(
         logger.info(f"   ↳ returned {len(rows)} rows")
         return result
     except sqlite3.Error as e:
+        # Raised as a ToolError so the result is flagged is_error=True and the
+        # model still reads the message and can retry with a corrected query.
         error_msg = f"SQL Error: {e}"
         logger.error(f"   ↳ {error_msg}")
-        return error_msg
+        raise ToolError(error_msg) from e
     finally:
         conn.close()
 
@@ -170,7 +178,11 @@ def resource_list_tables() -> list[str]:
 @mcp.resource("db://schema/{table_name}", mime_type="application/json")
 def resource_table_schema(table_name: str) -> list[dict]:
     """Resource: returns column info for a table as JSON."""
-    return get_table_schema(table_name)
+    try:
+        return get_table_schema(table_name)
+    except ToolError as e:
+        # Protocol "resource not found" (-32602 with the URI in error.data)
+        raise ResourceNotFoundError(str(e)) from e
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

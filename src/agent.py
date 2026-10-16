@@ -18,7 +18,7 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from mcp_client import MCPClient
+from mcp_client import MCPClient, result_text
 
 # ── Configuration ────────────────────────────────────────────────
 load_dotenv()
@@ -70,7 +70,7 @@ def _mcp_tools_to_openai_schema(tools) -> list[dict[str, Any]]:
             "function": {
                 "name": tool.name,
                 "description": tool.description or "",
-                "parameters": tool.inputSchema if tool.inputSchema else {"type": "object", "properties": {}},
+                "parameters": tool.input_schema if tool.input_schema else {"type": "object", "properties": {}},
             },
         }
         openai_tools.append(schema)
@@ -89,6 +89,7 @@ async def run_agent_loop(client: MCPClient, openai_client: OpenAI) -> None:
     print("  🗄️  Text2SQL Agent — powered by MCP")
     print("=" * 60)
     print(f"  Model:  {OPENAI_MODEL}")
+    print(f"  MCP:    protocol {client.protocol_version}")
     print(f"  Tools:  {tool_names}")
     print(f"  Type 'quit' or 'exit' to stop.\n")
 
@@ -129,8 +130,16 @@ async def run_agent_loop(client: MCPClient, openai_client: OpenAI) -> None:
                 break
 
             # Case B: LLM wants to call one or more tools
-            # Append the assistant message (with tool_calls) to history
-            messages.append(assistant_msg.model_dump())
+            # Append the assistant message (with tool_calls) to history.
+            # Only the standard fields: OpenAI-compatible providers (e.g. Groq)
+            # reject OpenAI-only extras such as "annotations".
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_msg.content,
+                    "tool_calls": [tc.model_dump(exclude_none=True) for tc in assistant_msg.tool_calls],
+                }
+            )
 
             for tool_call in assistant_msg.tool_calls:
                 fn_name = tool_call.function.name
@@ -140,8 +149,8 @@ async def run_agent_loop(client: MCPClient, openai_client: OpenAI) -> None:
 
                 try:
                     result = await client.call_tool(fn_name, fn_args)
-                    # Extract text from MCP result
-                    tool_output = result.content[0].text if result.content else "(empty)"
+                    # Extract text from MCP result (all blocks — list results span several)
+                    tool_output = result_text(result)
                 except Exception as e:
                     tool_output = f"Error: {e}"
                     logger.error(f"Tool call failed: {e}")
